@@ -13,6 +13,8 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 
 import os
 
+from nanochat.trm_ar import get_trm_ar_model
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
@@ -20,8 +22,8 @@ from contextlib import nullcontext
 import wandb
 import torch
 import torch.distributed as dist
+from torch.amp import autocast_mode
 
-from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import (
     tokenizing_distributed_data_loader,
     tokenizing_distributed_data_loader_with_state,
@@ -51,9 +53,14 @@ run = "dummy"  # wandb run name default ("dummy" is special - we won't log to wa
 device_type = ""  # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 
 # Model architecture
-depth = (
-    20  # the depth of the Transformer model to train, rest of the kwargs are derived
-)
+hidden_dim = 128
+num_layers = 3
+num_heads = 8
+y_loop = 6
+z_loop = 3
+dropout = 0.05
+seq_delimiter = 4096
+
 max_seq_len = 2048  # max context length
 
 supervision_steps = 16
@@ -108,9 +115,10 @@ user_config = {k: globals()[k] for k in config_keys}  # will be useful for loggi
 # Compute init
 device_type = autodetect_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+device = str(device)
 master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
 autocast_ctx = (
-    torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    autocast_mode.autocast(device_type=device_type, dtype=torch.bfloat16)
     if device_type == "cuda"
     else nullcontext()
 )
@@ -132,18 +140,11 @@ vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
 # Model kwargs are derived from the desired depth of the model
-num_layers = depth
-model_dim = (
-    depth * 64
-)  # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
-num_heads = max(
-    1, (model_dim + 127) // 128
-)  # head dim 128 (the division here is ceil div)
 num_kv_heads = (
     num_heads  # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
 )
 print0(f"num_layers: {num_layers}")
-print0(f"model_dim: {model_dim}")
+print0(f"hidden_dim: {hidden_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
 
@@ -170,17 +171,26 @@ print0(
 
 # Create a new model with random weights
 model_config_kwargs = dict(
-    sequence_len=max_seq_len,
+    hidden_dim=hidden_dim,
+    num_layers=num_layers,
+    num_heads=num_heads,
+    dropout=dropout,
     vocab_size=vocab_size,
-    n_layer=num_layers,
-    n_head=num_heads,
-    n_kv_head=num_kv_heads,
-    n_embd=model_dim,
+    y_loop=y_loop,
+    z_loop=z_loop,
 )
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model = get_trm_ar_model(
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        dropout=dropout,
+        vocab_size=vocab_size,
+        y_loop=y_loop,
+        z_loop=z_loop,
+        seq_delimiter=seq_delimiter,
+    )
 model.to_empty(
     device=device
 )  # All tensors get storage on target device but with uninitialized (garbage) data
@@ -188,7 +198,10 @@ model.init_weights()  # All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = model_tag if model_tag else f"d{depth}"  # e.g. d12
+output_dirname = (
+    model_tag if model_tag else f"d{num_layers * y_loop * z_loop}"
+)  # e.g. d12
+assert base_dir is not None
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = resume_from_step != -1
 if resuming:
@@ -200,7 +213,7 @@ if resuming:
     del model_data  # free up this memory after the copy
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(
+model: TinyRE = torch.compile(
     model, dynamic=False
 )  # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())

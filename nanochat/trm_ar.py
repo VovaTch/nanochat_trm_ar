@@ -1,6 +1,7 @@
 # TODO: KV cache
 
 from enum import Enum
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -275,6 +276,24 @@ class ARTransformerTRM(nn.Module):
     def z_init(self) -> nn.Buffer:
         return self._z_init
 
+    def _init_weights(self, module) -> None:
+        if isinstance(module, nn.Linear):
+            # https://arxiv.org/pdf/2310.17813
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+
+    def init_weights(self) -> None:
+        self.apply(self._init_weights)
+        for block in self._transformer_encoder:
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)  # type: ignore
+            torch.nn.init.zeros_(block.attn.c_proj.weight)  # type: ignore
+
     def forward(
         self, x: torch.Tensor | None, y: torch.Tensor, z: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -352,9 +371,9 @@ class TinyRecursiveModel(nn.Module):
         core: ARTransformerTRM,
         z_loop: int,
         y_loop: int,
-        input_embedding: nn.Module,
-        output_head: nn.Module,
-        q_head: nn.Module,
+        input_embedding: InputEmbedding,
+        output_head: LinearOutputHead,
+        q_head: LinearQOutputHead,
     ) -> None:
         """
         Initializer
@@ -374,6 +393,12 @@ class TinyRecursiveModel(nn.Module):
         self._input_embedding = input_embedding
         self._output_head = output_head
         self._q_head = q_head
+
+    def init_weights(self) -> None:
+        self._core.init_weights()
+        torch.nn.init.zeros_(self._output_head._head.weight)
+        if self._input_embedding._embedding.weight.device.type == "cuda":
+            self._input_embedding.to(dtype=torch.bfloat16)
 
     @property
     def core(self) -> ARTransformerTRM:
