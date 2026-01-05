@@ -19,28 +19,29 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
 
-import wandb
 import torch
 import torch.distributed as dist
+import wandb
 from torch.amp import autocast_mode
 
+from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
+from nanochat.common import (
+    DummyWandb,
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_base_dir,
+    print0,
+    print_banner,
+)
 from nanochat.dataloader import (
     tokenizing_distributed_data_loader,
     tokenizing_distributed_data_loader_with_state,
 )
-from nanochat.common import (
-    compute_init,
-    compute_cleanup,
-    print0,
-    DummyWandb,
-    print_banner,
-    get_base_dir,
-    autodetect_device_type,
-)
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.loss_eval import evaluate_bpb
+from nanochat.report import get_report
+from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_model
 
 print_banner()
@@ -204,6 +205,9 @@ output_dirname = (
 assert base_dir is not None
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = resume_from_step != -1
+
+optimizer_data = None
+meta_data = None
 if resuming:
     print0(f"Resuming optimization from step {resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(
@@ -213,9 +217,9 @@ if resuming:
     del model_data  # free up this memory after the copy
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model: TinyRE = torch.compile(
-    model, dynamic=False
-)  # the inputs to model will never change shape so dynamic=False is safe
+# model = torch.compile(
+#     model, dynamic=False
+# )  # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -256,6 +260,7 @@ optimizers = model.setup_optimizers(
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:
+    assert optimizer_data is not None
     for opt, dat in zip(optimizers, optimizer_data):
         opt.load_state_dict(dat)
     del optimizer_data  # free up the memory
@@ -263,9 +268,11 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 tokens_dir = os.path.join(base_dir, "tokenized_data")
-dataloader_resume_state_dict = (
-    None if not resuming else meta_data["dataloader_state_dict"]
-)
+if resuming:
+    assert meta_data is not None
+    dataloader_resume_state_dict = meta_data["dataloader_state_dict"]
+else:
+    dataloader_resume_state_dict = None
 train_loader = tokenizing_distributed_data_loader_with_state(
     device_batch_size,
     max_seq_len,
@@ -273,9 +280,14 @@ train_loader = tokenizing_distributed_data_loader_with_state(
     device=device,
     resume_state_dict=dataloader_resume_state_dict,
 )
-build_val_loader = lambda: tokenizing_distributed_data_loader(
-    device_batch_size, max_seq_len, split="val", device=device
-)
+
+
+def build_val_loader():
+    return tokenizing_distributed_data_loader(
+        device_batch_size, max_seq_len, split="val", device=device
+    )
+
+
 x, y, dataloader_state_dict = next(
     train_loader
 )  # kick off load of the very first batch of data
@@ -307,12 +319,15 @@ def get_muon_momentum(it):
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
+val_bpb = torch.inf
+
 if not resuming:
     step = 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0  # EMA of training loss
     total_training_time = 0  # total wall-clock time of training
 else:
+    assert meta_data is not None
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
@@ -322,6 +337,7 @@ else:
 
 # -----------------------------------------------------------------------------
 # Training loop
+mfu = 0.0
 while True:
     last_step = (
         step == num_iterations
@@ -439,14 +455,17 @@ while True:
     train_loss = torch.tensor(0)
     lrm = 1.0
 
+    grad_clip_enabled = grad_clip > 0.0
+    grad_norm = 0.0
+
     for micro_step in range(grad_accum_steps):
         accum_x.append(x.clone())
         accum_target.append(y.clone)
         accum_y_inner.append(
-            model.y_init.repeat((x.shape[0], x.shape[1], 1)).to(x.device)
+            model.core.y_init.repeat((x.shape[0], x.shape[1], 1)).to(x.device)
         )
         accum_z_inner.append(
-            model.z_init.repeat((x.shape[0], x.shape[1], 1)).to(x.device)
+            model.core.z_init.repeat((x.shape[0], x.shape[1], 1)).to(x.device)
         )
         x, y, dataloader_state_dict = next(train_loader)
 
@@ -466,7 +485,12 @@ while True:
             loss.backward()
 
         if grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                orig_model.parameters(), grad_clip
+            )
+            grad_norm = (
+                grad_norm_tensor.item()
+            )  # GPU tensor -> CPU float (note: cpu-gpu sync point)
 
         lrm = get_lr_multiplier(step)
         for opt in optimizers:
@@ -483,42 +507,6 @@ while True:
         synchronize()
     t1 = time.time()
     dt = t1 - t0
-    # for micro_step in range(grad_accum_steps):
-    #
-    #
-    #     with autocast_ctx:
-    #         loss = model(x, y)
-    #     train_loss = loss.detach()  # for logging
-    #     loss = (
-    #         loss / grad_accum_steps
-    #     )  # each .backward() is a grad sum => normalize loss here
-    #     loss.backward()
-    #     x, y, dataloader_state_dict = next(
-    #         train_loader
-    #     )  # prefetch the next batch while the GPU is busy with forward/backward
-    # # gradient clipping
-    # grad_clip_enabled = grad_clip > 0.0
-    # if grad_clip_enabled:
-    #     grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-    #         orig_model.parameters(), grad_clip
-    #     )
-    #     grad_norm = (
-    #         grad_norm_tensor.item()
-    #     )  # GPU tensor -> CPU float (note: cpu-gpu sync point)
-    # # step the optimizers
-    # lrm = get_lr_multiplier(step)
-    # for opt in optimizers:
-    #     for group in opt.param_groups:
-    #         group["lr"] = group["initial_lr"] * lrm
-    # muon_momentum = get_muon_momentum(step)
-    # for group in muon_optimizer.param_groups:
-    #     group["momentum"] = muon_momentum
-    # for opt in optimizers:
-    #     opt.step()
-    # model.zero_grad(set_to_none=True)
-    # synchronize()
-    # t1 = time.time()
-    # dt = t1 - t0
     # -------------------------------------------------------------------------
 
     # logging
@@ -566,7 +554,6 @@ print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
 # Log to report
-from nanochat.report import get_report
 
 get_report().log(
     section="Base model training",

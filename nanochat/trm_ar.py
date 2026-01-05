@@ -1,10 +1,16 @@
 # TODO: KV cache
 
 from enum import Enum
+from functools import partial
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Muon
+
+from nanochat.adamw import DistAdamW
+from nanochat.common import get_dist_info
+from nanochat.muon import DistMuon
 
 
 class EmbeddingType(Enum):
@@ -394,7 +400,13 @@ class TinyRecursiveModel(nn.Module):
         self._output_head = output_head
         self._q_head = q_head
 
+        self._loss_fn_cls = torch.nn.CrossEntropyLoss()
+        self._loss_fn_q_stop = torch.nn.BCEWithLogitsLoss()
+
     def init_weights(self) -> None:
+        """
+        Initializes the model's weights
+        """
         self._core.init_weights()
         torch.nn.init.zeros_(self._output_head._head.weight)
         if self._input_embedding._embedding.weight.device.type == "cuda":
@@ -469,6 +481,112 @@ class TinyRecursiveModel(nn.Module):
         _, _, output, latent = self.deep_recursion(x, y, z)
         return output, latent
 
+    def estimate_flops(self) -> int:
+        """
+        Estimates the number of flops activated per token
+
+        Returns:
+            int: Number of flops
+        """
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_embedding = self._input_embedding._embedding.weight.numel()
+        len, h, q, t = (
+            self.core._num_layers,
+            self.core._num_heads,
+            self.core._hidden_dim // self.core._hidden_dim,
+            self.core._seq_delimiter // 4,
+        )
+        num_flops_per_token = (
+            6 * (nparams - nparams_embedding)
+            + 12 * len * h * q * t * self._y_loop * self._z_loop
+        )
+        return num_flops_per_token
+
+    def setup_optimizers(
+        self,
+        unembedding_lr: float = 0.004,
+        embedding_lr: float = 0.2,
+        matrix_lr: float = 0.02,
+        weight_decay: float = 0.0,
+    ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
+        """
+        Initializes the optimizers: AdamW and Muon, each for the corresponding parameters.
+
+        Args:
+            unembedding_lr (float, optional): Learning rate for the unembedding parameters. Defaults to 0.004.
+            embedding_lr (float, optional): Learning rate for the embedding parameters. Defaults to 0.2.
+            matrix_lr (float, optional): Learning rate for the matrix parameters. Defaults to 0.02.
+            weight_decay (float, optional): Weight decay for the optimizer. Defaults to 0.0.
+
+        Returns:
+            tuple: Tuple containing the AdamW optimizer and the Muon optimizer
+        """
+        model_dim = self.core._hidden_dim
+        ddp, rank, _, _ = get_dist_info()
+        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        matrix_params = list(self.core._transformer_encoder.parameters())
+        embedding_params = list(self._input_embedding.parameters())
+        lm_head_params = list(self._output_head.parameters())
+        q_output_head_params = list(self._q_head.parameters())
+        assert len(list(self.parameters())) == len(matrix_params) + len(
+            embedding_params
+        ) + len(lm_head_params) + len(q_output_head_params)
+        # Create the AdamW optimizer for the embedding and lm_head
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        if rank == 0:
+            print(
+                f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+            )
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=q_output_head_params, lr=unembedding_lr * dmodel_lr_scale),
+        ]
+        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer: torch.optim.Optimizer = AdamWFactory(adam_groups, **adamw_kwargs)  # type: ignore
+        # Create the Muon optimizer for the linear layers
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer: torch.optim.Optimizer = MuonFactory(matrix_params, **muon_kwargs)  # type: ignore
+        # Combine them the two optimizers into one list
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return tuple(optimizers)  # type: ignore
+
+    def get_loss(
+        self, output: torch.Tensor, q_stop: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Returns the auto-regressive loss for the TRM. Includes also QStop loss (might be interferring though)
+
+        Args:
+            output (torch.Tensor): Output tensor
+            q_stop (torch.Tensor): QStop inference tensor
+            targets (torch.Tensor): Target tensor
+
+        Returns:
+            torch.Tensor: Auto-regressive loss
+        """
+        loss_cls = self._loss_fn_cls(output, targets)
+
+        pred_logits_prob = F.softmax(output, dim=-1)
+        entropy = -torch.sum(
+            pred_logits_prob * torch.log(pred_logits_prob + 1e-8), dim=-1
+        )
+        max_entropy = math.log(pred_logits_prob.size(-1))
+        certainty = 1 - (entropy / max_entropy)
+        target_halting = (torch.argmax(output, dim=-1) == targets) & (certainty >= 0.8)
+
+        loss_q_stop = self._loss_fn_q_stop(
+            q_stop.squeeze(), target_halting.float().squeeze()
+        )
+        loss = loss_cls + loss_q_stop
+        return loss
+
 
 def get_trm_ar_model(
     hidden_dim: int,
@@ -480,6 +598,22 @@ def get_trm_ar_model(
     y_loop: int = 6,
     z_loop: int = 3,
 ) -> TinyRecursiveModel:
+    """
+    Factory function to return the auto-regressive TRM model.
+
+    Args:
+        hidden_dim (int): The hidden dimension of the model.
+        num_layers (int): The number of layers in the model.
+        num_heads (int): The number of heads in the model.
+        seq_delimiter (int): The sequence delimiter for the model, defaults to 4096.
+        dropout (float): The dropout rate for the model, defaults to 0.1.
+        vocab_size (int): The vocabulary size of the model, defaults to 65.
+        y_loop (int): The number of deep recursion steps in the model, defaults to 6.
+        z_loop (int): The number of shallow recursion steps in the model, defaults to 3.
+
+    Returns:
+        TinyRecursiveModel: The auto-regressive TRM model
+    """
     core = ARTransformerTRM(
         hidden_dim=hidden_dim,
         num_layers=num_layers,
