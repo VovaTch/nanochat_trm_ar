@@ -6,11 +6,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Muon
 
 from nanochat.adamw import DistAdamW
 from nanochat.common import get_dist_info
-from nanochat.muon import DistMuon
+from nanochat.muon import DistMuon, Muon
 
 
 class EmbeddingType(Enum):
@@ -558,7 +557,11 @@ class TinyRecursiveModel(nn.Module):
         return tuple(optimizers)  # type: ignore
 
     def get_loss(
-        self, output: torch.Tensor, q_stop: torch.Tensor, targets: torch.Tensor
+        self,
+        output: torch.Tensor,
+        q_stop: torch.Tensor,
+        targets: torch.Tensor,
+        loss_reduction: str = "mean",
     ) -> torch.Tensor:
         """
         Returns the auto-regressive loss for the TRM. Includes also QStop loss (might be interferring though)
@@ -571,7 +574,10 @@ class TinyRecursiveModel(nn.Module):
         Returns:
             torch.Tensor: Auto-regressive loss
         """
-        loss_cls = self._loss_fn_cls(output, targets)
+        # loss_cls = self._loss_fn_cls(output, targets)
+        loss_cls = F.cross_entropy(
+            output.transpose(1, 2), targets, reduction=loss_reduction
+        )
 
         pred_logits_prob = F.softmax(output, dim=-1)
         entropy = -torch.sum(
@@ -581,11 +587,20 @@ class TinyRecursiveModel(nn.Module):
         certainty = 1 - (entropy / max_entropy)
         target_halting = (torch.argmax(output, dim=-1) == targets) & (certainty >= 0.8)
 
-        loss_q_stop = self._loss_fn_q_stop(
-            q_stop.squeeze(), target_halting.float().squeeze()
+        loss_q_stop = F.binary_cross_entropy_with_logits(
+            q_stop.squeeze(), target_halting.float().squeeze(), reduction=loss_reduction
         )
         loss = loss_cls + loss_q_stop
         return loss
+
+    def get_device(self) -> torch.device:
+        """
+        Returns the device of the model
+
+        Returns:
+            torch.device: Device of the model
+        """
+        return next(self.parameters()).device
 
 
 def get_trm_ar_model(

@@ -39,7 +39,7 @@ from nanochat.dataloader import (
     tokenizing_distributed_data_loader_with_state,
 )
 from nanochat.engine import Engine
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb_trm_ar
 from nanochat.report import get_report
 from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_model
@@ -73,8 +73,8 @@ target_flops = (
 )  # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20  # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 32  # per-device batch size (set to not OOM)
-total_batch_size = 524288  # total desired batch size, in #tokens
+device_batch_size = 2  # per-device batch size (set to not OOM)
+total_batch_size = 65536  # total desired batch size, in #tokens
 embedding_lr = 0.2  # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004  # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0  # weight decay for the embedding/unembedding parameters (Adam)
@@ -350,7 +350,7 @@ while True:
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb_trm_ar(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -460,7 +460,7 @@ while True:
 
     for micro_step in range(grad_accum_steps):
         accum_x.append(x.clone())
-        accum_target.append(y.clone)
+        accum_target.append(y.clone())
         accum_y_inner.append(
             model.core.y_init.repeat((x.shape[0], x.shape[1], 1)).to(x.device)
         )
