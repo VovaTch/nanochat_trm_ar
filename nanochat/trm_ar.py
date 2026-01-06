@@ -602,6 +602,107 @@ class TinyRecursiveModel(nn.Module):
         """
         return next(self.parameters()).device
 
+    @torch.inference_mode()
+    def generate_next_tokens(
+        self,
+        input_seq: torch.Tensor,
+        y: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        supervision_steps: int = 16,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generates a single token batch from input sequences with the same length.
+
+        Args:
+            input_seq (torch.Tensor): The input sequence.
+            temperature (float, optional): The temperature of the softmax distribution. Defaults to 0.7.
+            top_k (int, optional): The number of top tokens to consider. Defaults to 0.
+        """
+
+        if y is None:
+            y_init = self.core.y_init.repeat(
+                (input_seq.shape[0], input_seq.shape[1], 1)
+            ).to(input_seq.device)
+            y = y_init
+        elif input_seq.shape[1] != y.shape[1]:
+            y_init = self.core.y_init.repeat(
+                (input_seq.shape[0], input_seq.shape[1] - y.shape[1], 1)
+            )
+            y = torch.cat((y, y_init), dim=1)
+
+        if z is None:
+            z_init = self.core.z_init.repeat(
+                (input_seq.shape[0], input_seq.shape[1], 1)
+            ).to(input_seq.device)
+            z = z_init
+        elif input_seq.shape[1] != z.shape[1]:
+            z_init = self.core.z_init.repeat(
+                (input_seq.shape[0], input_seq.shape[1] - z.shape[1], 1)
+            )
+            z = torch.cat((z, z_init), dim=1)
+
+        outputs = None
+        for _ in range(supervision_steps):
+            assert y is not None
+            assert z is not None
+            y, z, outputs, q_stop = self.deep_recursion(input_seq, y, z)
+            if torch.all(q_stop):
+                break
+
+        assert outputs is not None
+
+        return outputs, y, z
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_seq: torch.Tensor,
+        max_seq_length: int,
+        temperature: float = 0.7,
+        top_k: int = 0,
+    ) -> torch.Tensor:
+        """
+        Generate a sequence with length max_seq_length given an input sequence
+
+        Args:
+            input_seq (torch.Tensor): The input sequence.
+            max_seq_length (int): The maximum length of the generated sequence.
+            temperature (float, optional): The temperature of the softmax distribution. Defaults to 0.7.
+            top_k (int, optional): The number of top tokens to consider. Defaults to 0.
+
+        Returns:
+            torch.Tensor: The generated sequence.
+        """
+        if input_seq.dim() == 1:
+            input_seq = input_seq.unsqueeze(0)
+        output_seq = input_seq
+
+        y = None
+        z = None
+
+        for _ in range(max_seq_length - len(input_seq[-1])):
+            next_logits, y, z = self.generate_next_tokens(output_seq, y, z)
+
+            if top_k > 0:
+                values, _ = torch.topk(
+                    next_logits, min(top_k, next_logits.shape[-1]), dim=2
+                )
+                kth_value = values[:, :, -1].unsqueeze(-1)
+                next_logits = torch.where(
+                    next_logits < kth_value, -float("inf"), next_logits
+                )
+
+            pre_softmax = next_logits[:, -1] / (temperature + 1e-8)
+            probs = torch.softmax(pre_softmax, dim=2)
+            dist = torch.distributions.Categorical(probs)
+            next_tokens = dist.sample()
+
+            output_seq = torch.cat(
+                (output_seq, next_tokens),
+                dim=1,
+            )
+        return output_seq
+
 
 def get_trm_ar_model(
     hidden_dim: int,

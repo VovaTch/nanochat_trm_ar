@@ -62,7 +62,7 @@ z_loop = 3
 dropout = 0.05
 seq_delimiter = 4096
 
-max_seq_len = 2048  # max context length
+max_seq_len = 1024  # max context length
 
 supervision_steps = 16
 
@@ -73,7 +73,7 @@ target_flops = (
 )  # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20  # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 2  # per-device batch size (set to not OOM)
+device_batch_size = 1  # per-device batch size (set to not OOM)
 total_batch_size = 65536  # total desired batch size, in #tokens
 embedding_lr = 0.2  # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004  # learning rate for the unembedding parameters (Adam)
@@ -93,7 +93,7 @@ core_metric_every = (
     2000  # every how many steps to evaluate the core metric (-1 = disable)
 )
 core_metric_max_per_task = 500  # examples per task in estimating the core metric
-sample_every = 2000  # every how many steps to sample from the model
+sample_every = 3  # every how many steps to sample from the model
 save_every = (
     -1
 )  # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
@@ -345,24 +345,24 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
-        model.eval()
-        val_loader = build_val_loader()
-        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            val_bpb = evaluate_bpb_trm_ar(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        wandb_run.log(
-            {
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "total_training_time": total_training_time,
-                "val/bpb": val_bpb,
-            }
-        )
-        model.train()
+    # if last_step or step % eval_every == 0:
+    #     model.eval()
+    #     val_loader = build_val_loader()
+    #     eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+    #     with autocast_ctx:
+    #         val_bpb = evaluate_bpb_trm_ar(model, val_loader, eval_steps, token_bytes)
+    #     print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+    #     if val_bpb < min_val_bpb:
+    #         min_val_bpb = val_bpb
+    #     wandb_run.log(
+    #         {
+    #             "step": step,
+    #             "total_training_flops": flops_so_far,
+    #             "total_training_time": total_training_time,
+    #             "val/bpb": val_bpb,
+    #         }
+    #     )
+    #     model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
