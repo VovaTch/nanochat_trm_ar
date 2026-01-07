@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from torch.amp import autocast_mode
+from torch.utils.tensorboard import SummaryWriter
 
 from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
 from nanochat.common import (
@@ -45,6 +46,7 @@ from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_model
 
 print_banner()
+writer = SummaryWriter()  # TensorBoard writer
 
 # -----------------------------------------------------------------------------
 # User settings
@@ -62,7 +64,7 @@ z_loop = 3
 dropout = 0.05
 seq_delimiter = 4096
 
-max_seq_len = 1024  # max context length
+max_seq_len = 2048  # max context length
 
 supervision_steps = 16
 
@@ -345,24 +347,26 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    # if last_step or step % eval_every == 0:
-    #     model.eval()
-    #     val_loader = build_val_loader()
-    #     eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
-    #     with autocast_ctx:
-    #         val_bpb = evaluate_bpb_trm_ar(model, val_loader, eval_steps, token_bytes)
-    #     print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-    #     if val_bpb < min_val_bpb:
-    #         min_val_bpb = val_bpb
-    #     wandb_run.log(
-    #         {
-    #             "step": step,
-    #             "total_training_flops": flops_so_far,
-    #             "total_training_time": total_training_time,
-    #             "val/bpb": val_bpb,
-    #         }
-    #     )
-    #     model.train()
+    if last_step or step % eval_every == 0:
+        model.eval()
+        val_loader = build_val_loader()
+        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+        with autocast_ctx:
+            val_bpb = evaluate_bpb_trm_ar(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        if val_bpb < min_val_bpb:
+            min_val_bpb = val_bpb
+
+        writer.add_scalar("val/bpb", val_bpb, step)
+        wandb_run.log(
+            {
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "total_training_time": total_training_time,
+                "val/bpb": val_bpb,
+            }
+        )
+        model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -407,6 +411,7 @@ while True:
                     tokens, num_samples=1, max_tokens=16, temperature=0
                 )
             print0(tokenizer.decode(sample[0]))
+            writer.add_text(prompt, tokenizer.decode(sample[0]), step)
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -530,6 +535,14 @@ while True:
     print0(
         f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m"
     )
+    writer.add_scalar("step", step, step)
+    writer.add_scalar("total_training_flops", flops_so_far, step)
+    writer.add_scalar("total_training_time", total_training_time, step)
+    writer.add_scalar("train/loss", debiased_smooth_loss, step)
+    writer.add_scalar("train/lrm", lrm, step)
+    writer.add_scalar("train/dt", dt, step)
+    writer.add_scalar("train/tok_per_sec", tok_per_sec, step)
+    writer.add_scalar("train/mfu", mfu, step)
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -583,5 +596,6 @@ get_report().log(
 )
 
 # cleanup
+writer.close()
 wandb_run.finish()  # wandb run finish
 compute_cleanup()

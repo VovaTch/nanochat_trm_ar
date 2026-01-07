@@ -291,7 +291,7 @@ class Engine:
             kv_cache_prefill = None
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         if self._model_is_trm:
-            logits, y_running, z_running = self.model.generate_single_token(ids)
+            logits, y_running, z_running = self.model.generate_next_tokens(ids)
         else:
             logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
@@ -374,13 +374,18 @@ class Engine:
             num_generated += 1
 
             # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(
-                1
-            )
+
             if self._model_is_trm:
-                logits, y_running, z_running = self.model.generate_single_token(ids, y_running, z_running)  # type: ignore
+                ids = torch.cat(
+                    [ids, torch.tensor([sampled_tokens]).to(ids.device)],
+                    dim=-1,
+                )
+                logits, y_running, z_running = self.model.generate_next_tokens(ids, y_running, z_running)  # type: ignore
                 logits = logits[:, -1, :]
             else:
+                ids = torch.tensor(
+                    token_column, dtype=torch.long, device=device
+                ).unsqueeze(1)
                 logits = self.model.forward(ids, kv_cache=kv_cache_decode)[
                     :, -1, :
                 ]  # (B, vocab_size)
