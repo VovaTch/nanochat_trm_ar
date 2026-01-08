@@ -37,7 +37,7 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 2048) -> None:
+    def __init__(self, dim: int, max_seq_len: int = 65536) -> None:
         super().__init__()
 
         if dim % 2:
@@ -254,6 +254,7 @@ class ARTransformerTRM(nn.Module):
         self._num_heads = num_heads
         self._dropout = dropout
         self._seq_delimiter = seq_delimiter
+        self.max_seq_len = seq_delimiter
         self._vocab_size = vocab_size
 
         self._transformer_encoder = nn.Sequential(
@@ -265,6 +266,7 @@ class ARTransformerTRM(nn.Module):
                     layer_idx=i,
                     is_causal=True,
                     dropout=dropout,
+                    max_seq_len=seq_delimiter,
                 )
                 for i in range(num_layers)
             ]
