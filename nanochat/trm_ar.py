@@ -329,7 +329,7 @@ class ARTransformerTRM(nn.Module):
 
 class InputEmbedding(nn.Module):
     def __init__(
-        self, embedding_dim: int, vocab_size: int, additional_emb: bool = True
+        self, embedding_dim: int, vocab_size: int, additional_emb: bool = False
     ) -> None:
         super().__init__()
         self._embedding_dim = embedding_dim
@@ -359,12 +359,13 @@ class LinearQOutputHead(nn.Module):
         self._seq_length = seq_length
 
         layers = []
-        layers.append(nn.Linear(hidden_dim, 1))
+        layers.append(nn.Linear(hidden_dim, 8))
 
         self._layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._layers[0](x)
+        x = torch.mean(x, dim=-1)
         return x.view(x.shape[0], -1)
 
 

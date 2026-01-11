@@ -56,9 +56,9 @@ run = "dummy"  # wandb run name default ("dummy" is special - we won't log to wa
 device_type = ""  # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 
 # Model architecture
-hidden_dim = 128
-num_layers = 3
-num_heads = 8
+hidden_dim = 256
+num_layers = 2
+num_heads = 32
 y_loop = 6
 z_loop = 3
 dropout = 0.05
@@ -75,8 +75,8 @@ target_flops = (
 )  # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20  # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 1  # per-device batch size (set to not OOM)
-total_batch_size = 65536  # total desired batch size, in #tokens
+device_batch_size = 4  # per-device batch size (set to not OOM)
+total_batch_size = 65536 * 2  # total desired batch size, in #tokens
 embedding_lr = 0.2  # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004  # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0  # weight decay for the embedding/unembedding parameters (Adam)
