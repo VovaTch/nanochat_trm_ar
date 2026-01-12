@@ -233,6 +233,7 @@ class ARTransformerTRM(nn.Module):
         seq_delimiter: int = 4096,
         dropout: float = 0.1,
         vocab_size: int = 65,
+        ff_dim: int = 2048,
     ) -> None:
         """
         Initializer
@@ -256,6 +257,7 @@ class ARTransformerTRM(nn.Module):
         self._seq_delimiter = seq_delimiter
         self.max_seq_len = seq_delimiter
         self._vocab_size = vocab_size
+        self._ff_dim = ff_dim
 
         self._transformer_encoder = nn.Sequential(
             *[
@@ -267,6 +269,7 @@ class ARTransformerTRM(nn.Module):
                     is_causal=True,
                     dropout=dropout,
                     max_seq_len=seq_delimiter,
+                    mlp_multiplier=ff_dim // hidden_dim,
                 )
                 for i in range(num_layers)
             ]
@@ -712,6 +715,7 @@ def get_trm_ar_model(
     num_layers: int,
     num_heads: int,
     seq_delimiter: int = 4096,
+    ff_dim: int = 2048,
     dropout: float = 0.1,
     vocab_size: int = 65,
     y_loop: int = 6,
@@ -740,6 +744,7 @@ def get_trm_ar_model(
         dropout=dropout,
         vocab_size=vocab_size,
         seq_delimiter=seq_delimiter,
+        ff_dim=ff_dim,
     )
     input_embedding = InputEmbedding(embedding_dim=hidden_dim, vocab_size=vocab_size)
     output_head = LinearOutputHead(hidden_dim=hidden_dim, vocab_size=vocab_size)
